@@ -1,0 +1,15 @@
+[package]
+name = "Quantum_cryptographic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "0.8.5"
+nalgebra = "0.33.0"
+ratatui = "0.28.0"
+crossterm = "0.28.1"
+clap = { version = "4.2.7", features = ["derive"] }
+
+
+
+
