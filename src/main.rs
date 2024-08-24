@@ -2,11 +2,12 @@ use rand::Rng;
 use nalgebra as na;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
-    widgets::{Axis, Block, Borders, Chart, Dataset, Paragraph},
-    Terminal,
+    text::{Span, Line},
+    widgets::{Axis, Block, Borders, Chart, Dataset, List, ListItem, Paragraph},
+    Frame, Terminal,
 };
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -117,6 +118,7 @@ struct App {
     error_rate: f64,
     final_error_rate: f64,
     prediction_success_rate: f64,
+    kalman_log: Vec<String>,
 }
 
 fn main() -> Result<(), io::Error> {
@@ -124,13 +126,11 @@ fn main() -> Result<(), io::Error> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-
-    // Create App
     let app = run_simulation();
 
-    // Main loop
     loop {
         terminal.draw(|f| ui(f, &app))?;
 
@@ -141,7 +141,6 @@ fn main() -> Result<(), io::Error> {
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -205,6 +204,11 @@ fn run_simulation() -> App {
     let errors = alice_key.iter().zip(&bob_key).filter(|&(a, b)| a != b).count();
     let error_rate = errors as f64 / alice_key.len() as f64;
 
+    let mut kalman_log = Vec::new();
+    for (i, (prediction, actual)) in predictions.iter().zip(actual_errors.iter()).enumerate() {
+        kalman_log.push(format!("Step {}: P: {:.3}, A: {:.3}", i, prediction.1, actual.1));
+    }
+
     App {
         predictions,
         actual_errors,
@@ -217,69 +221,11 @@ fn run_simulation() -> App {
         error_rate: error_rate * 100.0,
         final_error_rate,
         prediction_success_rate,
+        kalman_log
     }
 }
 
-fn ui(f: &mut ratatui::Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(2)
-        .constraints(
-            [
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(0),
-            ]
-                .as_ref(),
-        )
-        .split(f.area());
-
-    let title = Paragraph::new("QKD Simulation Results")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-        .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(title, chunks[0]);
-
-    let qubits_info = Paragraph::new(format!("Qubits sent: {} | Matching bases: {}", app.qubits_sent, app.matching_bases))
-        .style(Style::default().fg(Color::Magenta).add_modifier(Modifier::default()))
-        .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(qubits_info, chunks[1]);
-
-    let keys_info = Paragraph::new(format!(
-        "Alice's key: {:?} \n Bob's key: {:?}",
-        app.alice_key, app.bob_key
-    ))
-        .style(Style::default().fg(Color::LightBlue).add_modifier(Modifier::default()))
-        .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(keys_info, chunks[2]);
-
-    let match_info = Paragraph::new(format!(
-        "Keys match: {} | Eve active: {}",
-        app.keys_match, app.eve_active
-    ))
-        .style(Style::default().fg(Color::Green).add_modifier(Modifier::default()))
-        .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(match_info, chunks[3]);
-
-    let error_info = Paragraph::new(format!(
-        "Error rate: {:.2}% | Final error rate: {:.4}",
-        app.error_rate, app.final_error_rate
-    ))
-        .style(Style::default().fg(Color::Red).add_modifier(Modifier::default()))
-        .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(error_info, chunks[4]);
-
-    let prediction_info = Paragraph::new(format!(
-        "Prediction success rate: {:.4}",
-        app.prediction_success_rate
-    ))
-        .style(Style::default().fg(Color::Blue).add_modifier(Modifier::default()))
-        .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(prediction_info, chunks[5]);
-
+fn render_graph(f: &mut Frame, app: &App, area: Rect) {
     let datasets = vec![
         Dataset::default()
             .name("Predicted")
@@ -307,5 +253,126 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
                 .style(Style::default().fg(Color::Gray))
                 .bounds([0.0, 1.0]),
         );
-    f.render_widget(chart, chunks[6]);
+    f.render_widget(chart, area);
+}
+
+fn render_kalman_log(f: &mut Frame, app: &App, area: Rect) {
+    let log_items: Vec<ListItem> = app.kalman_log
+        .iter()
+        .map(|s| ListItem::new(Line::from(Span::raw(s))))
+        .collect();
+
+    let log_list = List::new(log_items)
+        .block(Block::default().title("Kalman Filter Log").borders(Borders::ALL))
+        .style(Style::default().fg(Color::White))
+        .highlight_style(Style::default().add_modifier(Modifier::ITALIC))
+        .highlight_symbol(">>");
+
+    f.render_widget(log_list, area);
+}
+
+fn render_simulation_info(f: &mut Frame, app: &App, area: Rect) {
+    let info = vec![
+        ("Qubits", format!("{} | Bases: {}", app.qubits_sent, app.matching_bases)),
+        ("Match", format!("{} | Eve  : {}", app.keys_match, app.eve_active)),
+        ("Err", format!("{:.2}% | Final: {:.4}", app.error_rate, app.final_error_rate)),
+        ("Pred success", format!("{:.4}", app.prediction_success_rate)),
+    ];
+    let max_left_label_length = info.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    let max_right_label_length = info.iter()
+        .map(|(_, value)| {
+            if let Some(pos) = value.find('|') {
+                pos
+            } else {
+                value.len()
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    let info_text: Vec<Line> = info.iter()
+        .map(|(label, value)| {
+            if let Some(pos) = value.find('|') {
+                let (left_part, right_part) = value.split_at(pos);
+                let padded_left_part  = format!("{:<width_left$}", left_part.trim(), width_left = max_right_label_length);
+                let padded_right_part = format!("{}{}"           , padded_left_part, right_part);
+                let padded_label      = format!("{:<width$}"     , label, width = max_left_label_length);
+                Line::from(Span::raw(format!("{}: {}", padded_label, padded_right_part)))
+            } else {
+                let padded_label = format!("{:<width$}", label, width = max_left_label_length);
+                Line::from(Span::raw(format!("{}: {}", padded_label, value)))
+            }
+        })
+        .collect();
+    let info_paragraph = Paragraph::new(info_text)
+        .block(Block::default().title("Sim Info").borders(Borders::ALL))
+        .style(Style::default().fg(Color::Green))
+        .alignment(ratatui::layout::Alignment::Left);
+
+    f.render_widget(info_paragraph, area);
+}
+fn render_keys(f: &mut Frame, app: &App, area: Rect) {
+    let keys_info = vec![
+        format!(" Alice's Keys: {:?}", app.alice_key),
+        format!(" Bob's   Keys: {:?}", app.bob_key),
+    ];
+
+    let keys_text: Vec<Line> = keys_info.iter()
+        .map(|s| Line::from(Span::raw(s)))
+        .collect();
+
+    let keys_paragraph = Paragraph::new(keys_text)
+        .block(Block::default().title("Keys").borders(Borders::ALL))
+        .style(Style::default().fg(Color::Cyan))
+        .alignment(ratatui::layout::Alignment::Left);
+
+    f.render_widget(keys_paragraph, area);
+}
+
+fn ui(f: &mut Frame, app: &App) {
+    let size = f.area();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Ratio(6, 9),  // Top section (graph + log)
+            Constraint::Ratio(3, 9),  // Bottom section (keys + info)
+        ].as_ref())
+        .split(size);
+
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(9, 12),  // Graph
+            Constraint::Ratio(3, 12),   // Kalman log
+        ].as_ref())
+        .split(chunks[0]);
+
+    let bottom_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Ratio(2, 5),  // Keys
+            Constraint::Ratio(3, 5),  // Simulation info
+        ].as_ref())
+        .split(chunks[1]);
+
+    let bottom_horizontal_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(2, 5),  // Keys and Simulation info
+            Constraint::Ratio(2, 5),  // Extended Kalman log
+        ].as_ref())
+        .split(chunks[1]);
+
+    let extended_log_area = Rect {
+        x: top_chunks[1].x,
+        y: top_chunks[1].y,
+        width: top_chunks[1].width,
+        height: top_chunks[1].height + bottom_horizontal_chunks[1].height,
+    };
+
+    render_graph(f, app, top_chunks[0]);
+    render_kalman_log(f, app, top_chunks[1]);
+    render_keys(f, app, bottom_horizontal_chunks[0].intersection(bottom_chunks[0]));
+    render_simulation_info(f, app, bottom_horizontal_chunks[0].intersection(bottom_chunks[1]));
+    render_kalman_log(f, app, extended_log_area);
 }
