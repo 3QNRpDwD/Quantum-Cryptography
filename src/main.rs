@@ -14,8 +14,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use std::io;
+use std::{io, thread};
+use std::time::{Duration, Instant};
 use clap::Parser;
+use sha2::{Digest, Sha256};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -32,6 +34,7 @@ struct Args {
     #[arg(short, long, default_value_t = 0.15)]
     error_rate: f64,
 }
+
 // KalmanFilter struct definition
 struct KalmanFilter {
     x: na::Vector2<f64>,  // State estimate
@@ -63,6 +66,46 @@ impl KalmanFilter {
         self.x += k * y;
         self.p -= k * na::RowVector2::new(self.p[(0, 0)], self.p[(1, 0)]);
     }
+}
+
+fn kalman_error_correction(alice_key: &[u8], bob_key: &[u8], kf: &mut KalmanFilter) -> (Vec<u8>, Vec<u8>) {
+    let mut corrected_alice = alice_key.to_vec();
+    let mut corrected_bob = bob_key.to_vec();
+
+    for window in (0..alice_key.len()).step_by(100) {
+        let end = std::cmp::min(window + 100, alice_key.len());
+        let alice_window = &alice_key[window..end];
+        let bob_window = &bob_key[window..end];
+
+        let errors = alice_window.iter().zip(bob_window).filter(|&(a, b)| a != b).count();
+        let error_rate = errors as f64 / alice_window.len() as f64;
+
+        let predicted_error_rate = kf.predict();
+        kf.update(error_rate);
+
+        // 예측된 오류율을 기반으로 비트 수정
+        for i in window..end {
+            if (alice_key[i] != bob_key[i]) && (rand::random::<f64>() < predicted_error_rate) {
+                corrected_bob[i] = alice_key[i]; // Bob의 키를 Alice의 키에 맞춰 수정
+            }
+        }
+    }
+
+    (corrected_alice, corrected_bob)
+}
+
+fn error_correction(alice_key: &[u8], bob_key: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    alice_key.iter().zip(bob_key).filter(|&(a, b)| a == b).map(|(&a, &b)| (a, b)).unzip()
+}
+
+fn privacy_amplification(key: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(key);
+    hasher.finalize().to_vec()
+}
+
+fn security_parameter_estimation(error_rate: f64, threshold: f64) -> bool {
+    error_rate < threshold
 }
 
 fn generate_random_bits(n: usize) -> Vec<u8> {
@@ -117,8 +160,10 @@ struct App {
     eve_active: bool,
     error_rate: f64,
     final_error_rate: f64,
+    prediction_error_rate: f64,
     prediction_success_rate: f64,
     kalman_log: Vec<String>,
+    protocol_aborted: bool
 }
 
 fn main() -> Result<(), io::Error> {
@@ -130,6 +175,7 @@ fn main() -> Result<(), io::Error> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let app = run_simulation();
+    let mut last_update = Instant::now();
 
     loop {
         terminal.draw(|f| ui(f, &app))?;
@@ -139,6 +185,8 @@ fn main() -> Result<(), io::Error> {
                 break;
             }
         }
+
+        thread::sleep(Duration::from_millis(100));
     }
 
     disable_raw_mode()?;
@@ -160,24 +208,16 @@ fn run_simulation() -> App {
     let mut actual_errors = Vec::new();
     let mut total_correct_predictions = 0;
 
-    // Alice's actions
     let alice_bits = generate_random_bits(args.qubits);
     let alice_bases = choose_random_bases(args.qubits);
-
-    // Transmission
     let transmitted_bits = match args.active_eve {
         true => simulate_eavesdropper(&alice_bits, args.error_rate),
         false => alice_bits.clone()
     };
 
-    // Bob's actions
     let bob_bases = choose_random_bases(args.qubits);
     let bob_measurements = measure_qubits(&transmitted_bits, &bob_bases, &alice_bases);
-
-    // Base comparison
     let matched_indices = compare_bases(&alice_bases, &bob_bases);
-
-    // Key creation
     let alice_key = create_key(&alice_bits, &matched_indices);
     let bob_key = create_key(&bob_measurements, &matched_indices);
 
@@ -196,11 +236,8 @@ fn run_simulation() -> App {
         kf.update(error_rate);
     }
 
-    // Results
-    let final_error_rate = actual_errors.iter().map(|&(_, e)| e).sum::<f64>() / actual_errors.len() as f64;
+    let prediction_error_rate = (actual_errors.iter().map(|&(_, e)| e).sum::<f64>() / actual_errors.len() as f64) * 100f64;
     let prediction_success_rate = total_correct_predictions as f64 / predictions.len() as f64;
-
-    // Calculate error rate
     let errors = alice_key.iter().zip(&bob_key).filter(|&(a, b)| a != b).count();
     let error_rate = errors as f64 / alice_key.len() as f64;
 
@@ -209,34 +246,47 @@ fn run_simulation() -> App {
         kalman_log.push(format!("Step {}: P: {:.3}, A: {:.3}", i, prediction.1, actual.1));
     }
 
+    // let (alice_corrected, bob_corrected) = error_correction(&alice_key, &bob_key);
+    let (alice_corrected, bob_corrected) = kalman_error_correction(&alice_key, &bob_key, &mut kf);
+    let final_alice_key = privacy_amplification(&alice_corrected);
+    let final_bob_key = privacy_amplification(&bob_corrected);
+    let final_errors = alice_corrected.iter().zip(&bob_corrected).filter(|&(a, b)| a != b).count();
+    let final_error_rate = (final_errors as f64 / final_alice_key.len() as f64);
+    let is_secure = security_parameter_estimation(final_error_rate / 100f64, 0.15);
+
     App {
         predictions,
         actual_errors,
         qubits_sent: args.qubits,
         matching_bases: matched_indices.len(),
-        alice_key: alice_key[..10].to_vec(),
-        bob_key: bob_key[..10].to_vec(),
-        keys_match: alice_key == bob_key,
+        alice_key: final_alice_key[..8].to_vec(),
+        bob_key:  final_bob_key[..8].to_vec(),
+        keys_match: final_alice_key == final_bob_key,
         eve_active: args.active_eve,
         error_rate: error_rate * 100.0,
         final_error_rate,
+        prediction_error_rate,
         prediction_success_rate,
-        kalman_log
+        kalman_log,
+        protocol_aborted: !is_secure
     }
 }
 
 fn render_graph(f: &mut Frame, app: &App, area: Rect) {
+    let predicted_data: Vec<(f64, f64)> = app.predictions.iter().map(|&(x, y)| (x, y)).collect();
+    let actual_data: Vec<(f64, f64)> = app.actual_errors.iter().map(|&(x, y)| (x, y)).collect();
+
     let datasets = vec![
         Dataset::default()
             .name("Predicted")
-            .marker(symbols::Marker::Braille)
-            .style(Style::default().fg(Color::Cyan))
-            .data(&app.predictions),
+            .marker(symbols::Marker::Dot)  // Changed the marker for better distinction
+            .style(Style::default().fg(Color::Magenta))  // Different color for the predicted line
+            .data(&predicted_data),
         Dataset::default()
             .name("Actual")
-            .marker(symbols::Marker::Dot)
-            .style(Style::default().fg(Color::Yellow))
-            .data(&app.actual_errors),
+            .marker(symbols::Marker::Braille)  // Changed the marker
+            .style(Style::default().fg(Color::Yellow))  // Different color for the actual line
+            .data(&actual_data),
     ];
 
     let chart = Chart::new(datasets)
@@ -245,16 +295,27 @@ fn render_graph(f: &mut Frame, app: &App, area: Rect) {
             Axis::default()
                 .title("Window")
                 .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, app.predictions.len() as f64]),
+                .bounds([0.0, app.predictions.len() as f64])
+                .labels(vec![
+                    Span::raw("0"),
+                    Span::raw(format!("{}", app.predictions.len())),
+                ]),
         )
         .y_axis(
             Axis::default()
                 .title("Error Rate")
                 .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, 1.0]),
+                .bounds([0.0, 1.0])
+                .labels(vec![
+                    Span::raw("0.0"),
+                    Span::raw("0.5"),
+                    Span::raw("1.0"),
+                ]),
         );
     f.render_widget(chart, area);
 }
+
+
 
 fn render_kalman_log(f: &mut Frame, app: &App, area: Rect) {
     let log_items: Vec<ListItem> = app.kalman_log
@@ -275,8 +336,8 @@ fn render_simulation_info(f: &mut Frame, app: &App, area: Rect) {
     let info = vec![
         ("Qubits", format!("{} | Bases: {}", app.qubits_sent, app.matching_bases)),
         ("Match", format!("{} | Eve  : {}", app.keys_match, app.eve_active)),
-        ("Err", format!("{:.2}% | Final: {:.4}", app.error_rate, app.final_error_rate)),
-        ("Pred success", format!("{:.4}", app.prediction_success_rate)),
+        ("Error", format!("{:.3}% | Pred : {:.3}% | Final : {:.3}%"  , app.error_rate, app.prediction_error_rate, app.final_error_rate)),
+        ("Pred success", format!("{:.4} | Aborted: {}", app.prediction_success_rate, app.protocol_aborted)),
     ];
     let max_left_label_length = info.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
     let max_right_label_length = info.iter()
@@ -358,8 +419,8 @@ fn ui(f: &mut Frame, app: &App) {
     let bottom_horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Ratio(2, 5),  // Keys and Simulation info
-            Constraint::Ratio(2, 5),  // Extended Kalman log
+            Constraint::Ratio(5, 5),  // Keys and Simulation info
+            Constraint::Ratio(3, 5),  // Extended Kalman log
         ].as_ref())
         .split(chunks[1]);
 
