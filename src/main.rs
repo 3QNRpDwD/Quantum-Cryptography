@@ -15,7 +15,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::{io, thread};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use clap::Parser;
 use sha2::{Digest, Sha256};
 
@@ -69,7 +69,7 @@ impl KalmanFilter {
 }
 
 fn kalman_error_correction(alice_key: &[u8], bob_key: &[u8], kf: &mut KalmanFilter) -> (Vec<u8>, Vec<u8>) {
-    let mut corrected_alice = alice_key.to_vec();
+    let corrected_alice = alice_key.to_vec();
     let mut corrected_bob = bob_key.to_vec();
 
     for window in (0..alice_key.len()).step_by(100) {
@@ -175,7 +175,6 @@ fn main() -> Result<(), io::Error> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let app = run_simulation();
-    let mut last_update = Instant::now();
 
     loop {
         terminal.draw(|f| ui(f, &app))?;
@@ -207,6 +206,7 @@ fn run_simulation() -> App {
     let mut predictions = Vec::new();
     let mut actual_errors = Vec::new();
     let mut total_correct_predictions = 0;
+    let mut kalman_log = Vec::new();
 
     let alice_bits = generate_random_bits(args.qubits);
     let alice_bases = choose_random_bases(args.qubits);
@@ -228,6 +228,7 @@ fn run_simulation() -> App {
         let prediction = kf.predict();
         predictions.push((i as f64, prediction));
         actual_errors.push((i as f64, error_rate));
+        kalman_log.push(format!("Step {}: P: {:.3}, A: {:.3}", i, prediction, error_rate));
 
         if (prediction - error_rate).abs() < 0.01 {
             total_correct_predictions += 1;
@@ -236,15 +237,15 @@ fn run_simulation() -> App {
         kf.update(error_rate);
     }
 
-    let prediction_error_rate = (actual_errors.iter().map(|&(_, e)| e).sum::<f64>() / actual_errors.len() as f64) * 100f64;
+    let prediction_error_rate = (predictions.iter().map(|&(_, e)| e).sum::<f64>() / predictions.len() as f64) * 100f64;
     let prediction_success_rate = total_correct_predictions as f64 / predictions.len() as f64;
     let errors = alice_key.iter().zip(&bob_key).filter(|&(a, b)| a != b).count();
     let error_rate = errors as f64 / alice_key.len() as f64;
 
-    let mut kalman_log = Vec::new();
-    for (i, (prediction, actual)) in predictions.iter().zip(actual_errors.iter()).enumerate() {
-        kalman_log.push(format!("Step {}: P: {:.3}, A: {:.3}", i, prediction.1, actual.1));
-    }
+
+    // for (i, (prediction, actual)) in predictions.iter().zip(actual_errors.iter()).enumerate() {
+    //
+    // }
 
     // let (alice_corrected, bob_corrected) = error_correction(&alice_key, &bob_key);
     let (alice_corrected, bob_corrected) = kalman_error_correction(&alice_key, &bob_key, &mut kf);
@@ -272,25 +273,9 @@ fn run_simulation() -> App {
     }
 }
 
-fn render_graph(f: &mut Frame, app: &App, area: Rect) {
-    let predicted_data: Vec<(f64, f64)> = app.predictions.iter().map(|&(x, y)| (x, y)).collect();
-    let actual_data: Vec<(f64, f64)> = app.actual_errors.iter().map(|&(x, y)| (x, y)).collect();
-
-    let datasets = vec![
-        Dataset::default()
-            .name("Predicted")
-            .marker(symbols::Marker::Dot)  // Changed the marker for better distinction
-            .style(Style::default().fg(Color::Magenta))  // Different color for the predicted line
-            .data(&predicted_data),
-        Dataset::default()
-            .name("Actual")
-            .marker(symbols::Marker::Braille)  // Changed the marker
-            .style(Style::default().fg(Color::Yellow))  // Different color for the actual line
-            .data(&actual_data),
-    ];
-
+fn render_graph(f: &mut Frame, app: &App, area: Rect, datasets: Vec<Dataset>, title: &str) {
     let chart = Chart::new(datasets)
-        .block(Block::default().title("Error Rate Prediction").borders(Borders::ALL))
+        .block(Block::default().title(title).borders(Borders::ALL))
         .x_axis(
             Axis::default()
                 .title("Window")
@@ -313,6 +298,31 @@ fn render_graph(f: &mut Frame, app: &App, area: Rect) {
                 ]),
         );
     f.render_widget(chart, area);
+}
+
+fn render_kalman_graph(f: &mut Frame, app: &App, area: Rect) {
+        let predicted_data: Vec<(f64, f64)> = app.predictions.iter().map(|&(x, y)| (x, y)).collect();
+        let datasets = vec![
+            Dataset::default()
+                .name("Predicted")
+                .marker(symbols::Marker::Braille)  // Changed the marker for better distinction
+                .style(Style::default().fg(Color::Magenta))  // Different color for the predicted line
+                .data(&predicted_data),
+        ];
+    render_graph(f, app, area, datasets, "Error Rate Prediction")
+}
+
+
+fn render_actual_graph(f: &mut Frame, app: &App, area: Rect,) {
+    let actual_data: Vec<(f64, f64)> = app.actual_errors.iter().map(|&(x, y)| (x, y)).collect();
+    let datasets = vec![
+        Dataset::default()
+            .name("Actual")
+            .marker(symbols::Marker::Braille)  // Changed the marker
+            .style(Style::default().fg(Color::Yellow))  // Different color for the actual line
+            .data(&actual_data),
+    ];
+    render_graph(f, app, area, datasets, "Error rate measurement")
 }
 
 
@@ -404,9 +414,17 @@ fn ui(f: &mut Frame, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Ratio(9, 12),  // Graph
-            Constraint::Ratio(3, 12),   // Kalman log
+            Constraint::Ratio(3, 12),  // Kalman log
         ].as_ref())
         .split(chunks[0]);
+
+    let graph_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Ratio(1, 2), // top graph
+            Constraint::Ratio(1, 2), // bottom graph
+        ].as_ref())
+        .split(top_chunks[0]);
 
     let bottom_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -431,7 +449,8 @@ fn ui(f: &mut Frame, app: &App) {
         height: top_chunks[1].height + bottom_horizontal_chunks[1].height,
     };
 
-    render_graph(f, app, top_chunks[0]);
+    render_kalman_graph(f, app, graph_chunks[0]);
+    render_actual_graph(f, app, graph_chunks[1]);
     render_kalman_log(f, app, top_chunks[1]);
     render_keys(f, app, bottom_horizontal_chunks[0].intersection(bottom_chunks[0]));
     render_simulation_info(f, app, bottom_horizontal_chunks[0].intersection(bottom_chunks[1]));
